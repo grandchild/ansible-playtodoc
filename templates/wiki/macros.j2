@@ -14,11 +14,11 @@
 	{%- if task.commands %}
 {{ task.commands | indent(2, true) }}
 	{%- endif -%}
-	{%- if task.content -%}
-		{%- if task.linked_content -%}
-[[File:{{ task.content }}|{{ task.content }}]]
+	{%- for content in task.content -%}
+		{%- if content.linked -%}
+[[File:{{ content.content }}|{{ content.content }}]]
 		{%- else %}
-{{ task.content | indent(2, true) }}
+{{ content.content | indent(2, true) }}
 		{%- endif %}
-	{%- endif %}
+	{%- endfor %}
 {% endmacro %}

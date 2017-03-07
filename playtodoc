@@ -7,6 +7,7 @@ import os.path as path
 from copy import deepcopy
 from glob import glob
 import re
+import itertools
 import jinja2
 import IPython
 
@@ -15,6 +16,7 @@ __version__ = "alpha"
 _DEFAULT_FILELENGTH_LIMIT = 1000
 
 verbose = False
+debug = False
 template_limit = _DEFAULT_FILELENGTH_LIMIT
 strings = None
 
@@ -26,7 +28,7 @@ class AnsibleObject(object):
 			try:
 				setattr(self, attr+suffix, raw[attr])
 			except KeyError:
-				if verbose:
+				if debug:
 					print("Warning: Key '{}' not found in {} '{}'.".format(
 						attr,
 						self.__class__.__name__,
@@ -45,25 +47,30 @@ class AnsibleObject(object):
 			filename = filename[:-5]
 		try:
 			with open(filename+".yml") as yf:
-				return yaml.safe_load(yf)
+				content = yaml.safe_load(yf)
 		except FileNotFoundError:
 			try:
 				with open(filename+".yaml") as yf:
-					return yaml.safe_load(yf)
+					content = yaml.safe_load(yf)
 			except FileNotFoundError:
-				if verbose:
+				if debug:
 					print("Couldn't find neither {0}.yml nor {0}.yaml".format(filename))
-		return None
+				return None
+		if type(content) is str and content.startswith("$ANSIBLE_VAULT;"):
+			if verbose:
+				print("Warning: Ansible-Vault not supported yet. If needed, decrypt the file temporarily to create full output.")
+			return None
+		else:
+			return content
 	
 	def combine_vars(self, *vars):
 		if not hasattr(self, "vars") or self.vars is None:
 			self.vars = {}
 		for vars_section in vars:
-			try:
-				for key, val in vars_section.items():
-					self.vars[key] = deepcopy(val)
-			except AttributeError:
+			if vars_section is None:
 				continue
+			for key, val in vars_section.items():
+				self.vars[key] = deepcopy(val)
 	
 	def unpack_list_of_dicts(list_of_dicts):
 		d = {}
@@ -75,7 +82,17 @@ class AnsibleObject(object):
 				if verbose:
 					print("Warning, not a dict while unpacking vars: {}".format(item))
 		return d
-			
+	
+	def create_templates_env(base_dir=""):
+		env = jinja2.Environment(
+			loader=jinja2.FileSystemLoader(base_dir),
+			undefined=jinja2.DebugUndefined
+		)
+		env.filters["regex_replace"] = AnsibleObject._regex_replace
+		return env
+	
+	def _regex_replace(value, pattern, repl):
+		return re.sub(pattern, repl, value)
 
 
 class Playbook(AnsibleObject):
@@ -108,19 +125,22 @@ class Play(AnsibleObject):
 			self.combine_vars(*file_vars, self.vars_raw)
 		except AttributeError:
 			if hasattr(self.vars, "__getitem__"):
-				self.combine_vars(*file_vars, AnsibleObject.unpack_list_of_dicts(self.vars))
+				self.combine_vars(*file_vars, AnsibleObject.unpack_list_of_dicts(self.vars_raw))
+				print(self.vars)
 			else:
 				raise TypeError("Play vars are of incompatible type ({}): {}".format(type(self.vars), self.vars))
 		
-		self.roles = [
-			Role(
-				role_name,
-				base_dir=base_dir,
-				vars=self.vars,
-				modules=modules
-			)
-			for role_name in self.roles_raw
-		] if hasattr(self, "roles_raw") else []
+		self.roles = []
+		if hasattr(self, "roles_raw"):
+			for role_name in self.roles_raw:
+				role = Role(
+					role_name,
+					base_dir=base_dir,
+					vars=self.vars,
+					modules=modules
+				)
+				self.roles.append(role)
+				self.combine_vars(self.vars, role.vars)
 		self.tasks = [
 			Task(
 				task_raw,
@@ -135,10 +155,7 @@ class Role(AnsibleObject):
 	def __init__(self, name, base_dir="", vars={}, modules={}):
 		self.name = name
 		self.base_dir = base_dir
-		self.templates_env = jinja2.Environment(
-			loader=jinja2.FileSystemLoader(self._sub("templates")),
-			undefined=jinja2.DebugUndefined
-		)
+		self.templates_env = AnsibleObject.create_templates_env(self._sub("templates"))
 		self.tasks_raw = AnsibleObject.load_yaml(self._sub("tasks", "main.yml"))
 		self.defaults_raw = AnsibleObject.load_yaml(self._sub("defaults", "main.yml"))
 		self.vars_raw = AnsibleObject.load_yaml(self._sub("vars", "main.yml"))
@@ -168,27 +185,25 @@ class Task(AnsibleObject):
 	def __init__(self, task_raw, base_dir="", vars={}, modules={}, templates_env=None):
 		self.task_raw = task_raw
 		self.vars = vars
-		self.map_to_attrs(task_raw, ["name"])
-		self.map_to_raw_attrs(task_raw, ["with_items", "notify", "delegate_to", "with_dict", "with_nested", "become"])
+		self.map_to_attrs(task_raw, ["name", "with_items", "with_dict", "with_nested", "with_subitems"])
+		self.map_to_raw_attrs(task_raw, ["become", "notify", "delegate_to"])
 		self.module_name, self.module = self._detect_module(modules)
 		self.values = self._get_values()
-		self.templates_env = jinja2.Environment(
-			loader=jinja2.FileSystemLoader(base_dir),
-			undefined=jinja2.DebugUndefined
-		) if templates_env is None else templates_env
-		if hasattr(self, "with_items_raw"):
-			if type(self.with_items_raw) is list:
-				self.vars["item"] = ",".join(self.with_items_raw)
-			else:
-				self.vars["item"] = self.templates_env.from_string(self.with_items_raw).render(vars)
-		# if hasattr(self, "with_dict_raw"):
-		# 	self.vars["item"] = {"key": "__test__", "value": "test!"}
+		self.templates_env = AnsibleObject.create_templates_env(base_dir) if templates_env is None else templates_env
+		if hasattr(self, "with_items"):
+			self.items = self._expand_templates(self.with_items)
+		if hasattr(self, "with_nested"):
+			levels = []
+			for level in self.with_nested:
+				levels.append(self._expand_templates(level) or [None])
+			self.items = list(itertools.product(*levels))
+		if hasattr(self, "with_dict"):
+			self.items = self._expand_templates(self.with_dict)
 		self.text = self._expand_text()
 		try:
 			self.commands = self._expand_commands()
 		except KeyError as ke:
 			pass
-		self.linked_content = False
 		try:
 			self.content = self._expand_content()
 		except KeyError as ke:
@@ -237,22 +252,37 @@ class Task(AnsibleObject):
 		for line in self.module["commands"].splitlines():
 			new_line = self._expand_vars(line)
 			if new_line is not None:
-				lines.append(new_line)
+				if type(new_line) is list:
+					for l in new_line:
+						lines.append(l)
+				else:
+					lines.append(new_line)
 		return "\n".join(lines)
 	
 	def _expand_content(self):
 		content = self._expand_vars(self.module["content"])
+		if type(content) is list:
+			return [self._expand_content_inner(c) for c in content]
+		else:
+			return [self._expand_content_inner(content)]
+	
+	def _expand_content_inner(self, content):
+		linked_content = False
 		if content is None:
-			return None
+			return {"linked": linked_content, "content": None}
 		if self.module_name in ["template"]:
-			content = self.templates_env.get_template(content).render(self.vars)
+			try:
+				content = self.templates_env.get_template(content).render(self.vars)
+			except jinja2.exceptions.UndefinedError as ue:
+				print("Error: Undefined variables in file '{}':\n\t{}.".format(content, ue))
+				content = ""
 		if len(content) > template_limit:
 			output_filename = self.values["dest"].replace("/", "_")
 			with open(output_filename, "w") as f:
 				f.write(content)
 			content = output_filename
-			self.linked_content = True
-		return content
+			linked_content = True
+		return {"linked": linked_content, "content": content}
 	
 	def _expand_vars(self, line):
 		# playtodoc vars
@@ -271,7 +301,13 @@ class Task(AnsibleObject):
 		for var in var_names:
 			line = re.sub(r"\$[\w\|]*"+var+r"[\w\|]*\$", self.values[var], line, flags=re.I)
 		# ansible vars
-		line = self.templates_env.from_string(line).render(self.vars)
+		if "item" in line:
+			try:
+				line = [self.templates_env.from_string(line).render(**self.vars, item=item) for item in self.items]
+			except TypeError as te:
+				print("Error: Undefined variables in '{}'\n\t{}.".format(line, te))
+		else:
+			line = self.templates_env.from_string(line).render(self.vars)
 		return line
 	
 	def _expand_aliases(self, var_list):
@@ -281,10 +317,27 @@ class Task(AnsibleObject):
 				var = [v for v in var.split("|") if v in self.values.keys()][0]
 			new_list.append(var)
 		return new_list
+	
+	def _expand_templates(self, obj):
+		if type(obj) is str:
+			match = re.match(r"\{\{(.+?)\}\}", obj)
+			if match and obj == ("{{" + match.groups()[0] + "}}" ):
+				res = self.templates_env.compile_expression(match.groups()[0])(**self.vars)
+				if res is None and verbose:
+					print("Warning: Possibly undefined variable '{}'.\n\tAre you using Ansible-Vaults? `ansible-vault decrypt` them and retry.".format(match.groups()[0].strip()))
+			else:
+				return obj
+		elif type(obj) is dict:
+			return {key: self._expand_templates(val) for key, val in obj.items()}
+		elif type(obj) is list:
+			return [self._expand_templates(val) for val in obj]
+		else:
+			return obj
 
 
 def main():
 	global verbose
+	global debug
 	global strings
 	global template_limit
 	output_formats = [s.replace("templates/", "").replace("/main.j2", "") for s in glob("templates/*/main.j2")]
@@ -301,9 +354,12 @@ def main():
 	                    help="Template and file inline character limit. Rendered templates and files longer than this will be printed into separate files and linked to. Defaults to {}.".format(_DEFAULT_FILELENGTH_LIMIT))
 	parser.add_argument("-v", "--verbose", action="store_true", default=False,
 	                    help="Be more verbose")
+	parser.add_argument("-d", "--debug", action="store_true", default=False,
+	                    help="Show debugging messages")
 	
 	args = parser.parse_args()
 	verbose = args.verbose
+	debug = args.debug
 	template_limit = args.limit
 	modules, strings = setup("en")
 	playbook = load_playbook(args.playbook, args.basedir, modules)

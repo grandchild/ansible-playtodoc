@@ -18,13 +18,13 @@
 {{ task.commands }}
 ```
 	{%- endif -%}
-	{%- if task.content -%}
-		{%- if task.linked_content -%}
-[{{ task.content }}](/{{ task.content }})
+	{%- for content in task.content -%}
+		{%- if content.linked -%}
+[{{ content.content }}](/{{ content.content }})
 		{%- else %}
 ```
-{{ task.content }}
+{{ content.content }}
 ```
 		{%- endif %}
-	{%- endif %}
+	{%- endfor %}
 {% endmacro %}
