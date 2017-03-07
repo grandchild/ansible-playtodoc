@@ -1,0 +1,24 @@
+{% macro role_view(role) %}
+=== {{ role.name }} ===
+	{% for task in role.tasks -%}
+{{ task_view(task) }}
+	{%- endfor %}
+{% endmacro %}
+
+
+{% macro task_view(task) %}
+	{%- for text in task.text %}
+
+{{ text }}.
+	{%- endfor -%}
+	{%- if task.commands %}
+{{ task.commands | indent(2, true) }}
+	{%- endif -%}
+	{%- if task.content -%}
+		{%- if task.linked_content -%}
+[[File:{{ task.content }}|{{ task.content }}]]
+		{%- else %}
+{{ task.content | indent(2, true) }}
+		{%- endif %}
+	{%- endif %}
+{% endmacro %}

@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+
+import yaml
+import argparse
+import sys
+import os.path as path
+from copy import deepcopy
+from glob import glob
+import re
+import jinja2
+import IPython
+
+
+__version__ = "alpha"
+_DEFAULT_FILELENGTH_LIMIT = 1000
+
+verbose = False
+template_limit = _DEFAULT_FILELENGTH_LIMIT
+strings = None
+
+
+class AnsibleObject(object):
+	"""Abstract base class for Ansible representations"""
+	def map_to_attrs(self, raw, attrs, fail_on_error=False, suffix=""):
+		for attr in attrs:
+			try:
+				setattr(self, attr+suffix, raw[attr])
+			except KeyError:
+				if verbose:
+					print("Warning: Key '{}' not found in {} '{}'.".format(
+						attr,
+						self.__class__.__name__,
+						raw["name"]
+					))
+				if fail_on_error:
+					sys.exit(1)
+	
+	def map_to_raw_attrs(self, raw, attrs, fail_on_error=False):
+		self.map_to_attrs(raw, attrs, fail_on_error=fail_on_error, suffix="_raw")
+	
+	def load_yaml(filename):
+		if filename.endswith(".yml"):
+			filename = filename[:-4]
+		if filename.endswith(".yaml"):
+			filename = filename[:-5]
+		try:
+			with open(filename+".yml") as yf:
+				return yaml.safe_load(yf)
+		except FileNotFoundError:
+			try:
+				with open(filename+".yaml") as yf:
+					return yaml.safe_load(yf)
+			except FileNotFoundError:
+				if verbose:
+					print("Couldn't find neither {0}.yml nor {0}.yaml".format(filename))
+		return None
+	
+	def combine_vars(self, *vars):
+		if not hasattr(self, "vars") or self.vars is None:
+			self.vars = {}
+		for vars_section in vars:
+			try:
+				for key, val in vars_section.items():
+					self.vars[key] = deepcopy(val)
+			except AttributeError:
+				continue
+	
+	def unpack_list_of_dicts(list_of_dicts):
+		d = {}
+		for item in list_of_dicts:
+			try:
+				for key, val in item.items():
+					d[key] = val
+			except AttributeError:
+				if verbose:
+					print("Warning, not a dict while unpacking vars: {}".format(item))
+		return d
+			
+
+
+class Playbook(AnsibleObject):
+	"""An Ansible Playbook representation"""
+	
+	def __init__(self, playbook_raw, base_dir="", modules={}):
+		self.plays = [
+			Play(
+				play_raw,
+				base_dir=base_dir,
+				modules=modules
+			)
+			for play_raw in playbook_raw
+		]
+	
+	def __len__(self):
+		return len(self.plays)
+
+
+class Play(AnsibleObject):
+	"""An Ansible Play representation"""
+	def __init__(self, play_raw, base_dir="", modules={}):
+		self.map_to_attrs(play_raw, ["name", "hosts", "become", "user", "vars_files"])
+		self.map_to_raw_attrs(play_raw, ["roles", "tasks", "vars"])
+		try:
+			file_vars = [AnsibleObject.load_yaml(path.join(base_dir, file)) for file in self.vars_files]
+		except AttributeError:
+			file_vars = []
+		try:
+			self.combine_vars(*file_vars, self.vars_raw)
+		except AttributeError:
+			if hasattr(self.vars, "__getitem__"):
+				self.combine_vars(*file_vars, AnsibleObject.unpack_list_of_dicts(self.vars))
+			else:
+				raise TypeError("Play vars are of incompatible type ({}): {}".format(type(self.vars), self.vars))
+		
+		self.roles = [
+			Role(
+				role_name,
+				base_dir=base_dir,
+				vars=self.vars,
+				modules=modules
+			)
+			for role_name in self.roles_raw
+		] if hasattr(self, "roles_raw") else []
+		self.tasks = [
+			Task(
+				task_raw,
+				modules=modules,
+				base_dir=base_dir
+			)
+			for task_raw in self.tasks_raw
+		] if hasattr(self, "tasks_raw") else []
+
+class Role(AnsibleObject):
+	"""An Ansible Role representation"""
+	def __init__(self, name, base_dir="", vars={}, modules={}):
+		self.name = name
+		self.base_dir = base_dir
+		self.templates_env = jinja2.Environment(
+			loader=jinja2.FileSystemLoader(self._sub("templates")),
+			undefined=jinja2.DebugUndefined
+		)
+		self.tasks_raw = AnsibleObject.load_yaml(self._sub("tasks", "main.yml"))
+		self.defaults_raw = AnsibleObject.load_yaml(self._sub("defaults", "main.yml"))
+		self.vars_raw = AnsibleObject.load_yaml(self._sub("vars", "main.yml"))
+		self.handlers_raw = AnsibleObject.load_yaml(self._sub("handlers", "main.yml"))
+		
+		self.combine_vars(self.defaults_raw, vars, self.vars_raw)
+		self.tasks = [
+			Task(
+				task_raw,
+				vars=self.vars,
+				modules=modules,
+				base_dir=base_dir,
+				templates_env=self.templates_env
+			)
+			for task_raw in self.tasks_raw
+		] if self.tasks_raw is not None else []
+	
+	def _sub(self, dirname, filename=None):
+		if not filename:
+			return path.join(self.base_dir, "roles", self.name, dirname)
+		else:
+			return path.join(self.base_dir, "roles", self.name, dirname, filename)
+
+
+class Task(AnsibleObject):
+	"""An Ansible Task representation"""
+	def __init__(self, task_raw, base_dir="", vars={}, modules={}, templates_env=None):
+		self.task_raw = task_raw
+		self.vars = vars
+		self.map_to_attrs(task_raw, ["name"])
+		self.map_to_raw_attrs(task_raw, ["with_items", "notify", "delegate_to", "with_dict", "with_nested", "become"])
+		self.module_name, self.module = self._detect_module(modules)
+		self.values = self._get_values()
+		self.templates_env = jinja2.Environment(
+			loader=jinja2.FileSystemLoader(base_dir),
+			undefined=jinja2.DebugUndefined
+		) if templates_env is None else templates_env
+		if hasattr(self, "with_items_raw"):
+			if type(self.with_items_raw) is list:
+				self.vars["item"] = ",".join(self.with_items_raw)
+			else:
+				self.vars["item"] = self.templates_env.from_string(self.with_items_raw).render(vars)
+		# if hasattr(self, "with_dict_raw"):
+		# 	self.vars["item"] = {"key": "__test__", "value": "test!"}
+		self.text = self._expand_text()
+		try:
+			self.commands = self._expand_commands()
+		except KeyError as ke:
+			pass
+		self.linked_content = False
+		try:
+			self.content = self._expand_content()
+		except KeyError as ke:
+			pass
+	
+	def _detect_module(self, modules):
+		for key, _ in self.task_raw.items():
+			if key in modules.keys():
+				self.module_name = key
+				for version in modules[key]:
+					if not hasattr(version, "if"):
+						return key, version
+					match = True
+					for var, val in version["if"].items():
+						if not hasattr(self.task_raw[key], var):
+							self.task_raw[key][var] = None
+						if type(val) is list:
+							match &= any([self.task_raw[key][var] == v for v in val])
+						else:
+							match &= self.task_raw[key][var] == var
+					if match:
+						return key, version
+		return "_unsupported", modules["_unsupported"][0]
+	
+	def _get_values(self):
+		if self.module_name == "_unsupported":
+			task_raw_copy = deepcopy(self.task_raw)
+			_ansible_task = yaml.dump({"name": task_raw_copy["name"]}, default_flow_style=False)
+			task_raw_copy.pop("name")
+			_ansible_task += yaml.dump(task_raw_copy, default_flow_style=False)
+			return {"_ansible_task": _ansible_task}
+		else:
+			return self.task_raw[self.module_name]
+	
+	def _expand_text(self):
+		lines = []
+		for line_key in self.module["text"]:
+			line = strings["modules"][self.module_name][line_key].strip()
+			new_line = self._expand_vars(line)
+			if new_line is not None:
+				lines.append(new_line)
+		return lines
+	
+	def _expand_commands(self):
+		lines = []
+		for line in self.module["commands"].splitlines():
+			new_line = self._expand_vars(line)
+			if new_line is not None:
+				lines.append(new_line)
+		return "\n".join(lines)
+	
+	def _expand_content(self):
+		content = self._expand_vars(self.module["content"])
+		if content is None:
+			return None
+		if self.module_name in ["template"]:
+			content = self.templates_env.get_template(content).render(self.vars)
+		if len(content) > template_limit:
+			output_filename = self.values["dest"].replace("/", "_")
+			with open(output_filename, "w") as f:
+				f.write(content)
+			content = output_filename
+			self.linked_content = True
+		return content
+	
+	def _expand_vars(self, line):
+		# playtodoc vars
+		opt_groups = re.findall(r"(\[\[.+?\]\])", line, flags=re.I)
+		for opt in opt_groups:
+			opt_vars = re.findall(r"\$([a-z_\|]+)\$", opt, flags=re.I)
+			opt_vars = self._expand_aliases(opt_vars)
+			if not any([v in self.values.keys() for v in opt_vars]):
+				line = line.replace(opt, "")
+			else:
+				line = line.replace(opt, opt[2:-2])
+		var_names = re.findall(r"\$([a-z_\|]+)\$", line, flags=re.I)
+		var_names = self._expand_aliases(var_names)
+		if any([v not in self.values.keys() for v in var_names]):
+			return None
+		for var in var_names:
+			line = re.sub(r"\$[\w\|]*"+var+r"[\w\|]*\$", self.values[var], line, flags=re.I)
+		# ansible vars
+		line = self.templates_env.from_string(line).render(self.vars)
+		return line
+	
+	def _expand_aliases(self, var_list):
+		new_list = []
+		for var in var_list:
+			if "|" in var:
+				var = [v for v in var.split("|") if v in self.values.keys()][0]
+			new_list.append(var)
+		return new_list
+
+
+def main():
+	global verbose
+	global strings
+	global template_limit
+	output_formats = [s.replace("templates/", "").replace("/main.j2", "") for s in glob("templates/*/main.j2")]
+	parser = argparse.ArgumentParser(description="Convert Ansible Playbooks to various Markup format for human consumption.")
+	parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
+	parser.add_argument("playbook", metavar="playbook.yml", type=str)
+	parser.add_argument("-b", "--basedir", type=str, default=".",
+	                    help="Ansible base dir for playbooks, roles, vars, etc.")
+	parser.add_argument("-f", "--format", type=str, default="wiki",
+	                    help="Output format, can be one of '{}'".format("', '".join(output_formats)))
+	parser.add_argument("-o", "--output", type=str, metavar="FILENAME", default="",
+	                    help="Output filename")
+	parser.add_argument("-l", "--limit", type=int, default=_DEFAULT_FILELENGTH_LIMIT,
+	                    help="Template and file inline character limit. Rendered templates and files longer than this will be printed into separate files and linked to. Defaults to {}.".format(_DEFAULT_FILELENGTH_LIMIT))
+	parser.add_argument("-v", "--verbose", action="store_true", default=False,
+	                    help="Be more verbose")
+	
+	args = parser.parse_args()
+	verbose = args.verbose
+	template_limit = args.limit
+	modules, strings = setup("en")
+	playbook = load_playbook(args.playbook, args.basedir, modules)
+	if args.output == "":
+		output_filename = re.sub(r"\.ya?ml$", "." + args.format, args.playbook)
+	else:
+		output_filename = re.sub(r"(.)(\." + args.format + r")?$", "$1." + args.format, args.output)
+	output = render_output(playbook, args.format)
+	with open(output_filename, "w") as of:
+		of.write(output)
+
+def setup(lang="en"):
+	with open("modules.yml") as yf:
+		modules = yaml.safe_load(yf)
+	try:
+		with open("strings/"+lang+".yml") as yf:
+			strings = yaml.safe_load(yf)
+	except FileNotFoundError as fnfe:
+		print("No locale '{}' found. Using English locale.".format(lang))
+		with open("strings/en.yml") as yf:
+			strings = yaml.safe_load(yf)
+	return modules, strings
+
+def load_playbook(filename, base_dir="", modules={}):
+	try:
+		with open(path.join(base_dir, filename)) as pf:
+			playbook_raw = yaml.safe_load(pf)
+	except FileNotFoundError as fnfe:
+		print(fnfe)
+		sys.exit(1)
+	return Playbook(playbook_raw, base_dir=base_dir, modules=modules)
+
+def render_output(playbook, output_format):
+	env = jinja2.Environment(
+		loader=jinja2.FileSystemLoader("templates/" + output_format),
+	)
+	return env.get_template("main.j2").render(plays=playbook.plays, strings=strings)
+
+if __name__ == "__main__":
+	main()

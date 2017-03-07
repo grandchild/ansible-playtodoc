@@ -1,0 +1,15 @@
+{%- import 'macros.j2' as m -%}
+{%- for play in plays -%}
+## {{ play.name }}
+	{%- for role in play.roles %}
+{{ m.role_view(role) }}
+	{%- endfor %}
+
+	{%- if play.tasks -%}
+### {{ strings.general.general_tasks_header }}
+	{% endif -%}
+	{%- for task in play.tasks -%}
+{{ m.task_view(task) }}
+	{%- endfor %}
+
+{% endfor %}

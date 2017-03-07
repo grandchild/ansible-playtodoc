@@ -1,0 +1,52 @@
+modules:
+  file:
+    create the file $path|dest|name$: >
+      Create the file $path|dest|name$ on the server
+    create the directory $path|dest|name$: >
+      Create the directory $path|dest|name$ on the server
+    owned by user $owner$ and group $group$: >
+      owned by user $owner$[[ and group $group$]]
+    delete $path|dest|name$: >
+      Delete $path|dest|name$
+  
+  copy:
+    copy the following file(s) to $dest$: >
+      Copy the following file(s) to $dest$:
+    $src$: >
+      $src$
+  
+  user:
+    the user $name$ of group $group$ exists: >
+      Make sure the user $name$ [[of group $group$ ]]exists
+    and is in the following groups $groups$: >
+      and is in the following additional groups: $groups$
+  
+  template:
+    create the file $dest$ with the following contents: >
+      Create the file $dest$ with the following contents:
+  
+  package:
+    make sure the following packages are installed: >
+      Make sure the following package(s) is/are installed:
+    install or update the following packages: >
+      Install (or update) the following package(s):
+  
+  _unsupported:
+    this ansible module is unsupported: >
+      This Ansible module is unsupported
+    this is the ansible task code: >
+      This is the Ansible task code:
+
+
+general:
+  handlers:
+    finally after changes do the following: >
+      Finally, after changes do the following:
+  
+  become:
+    execute the following as root: >
+      Execute the following as root:
+  
+  tasks:
+    general_tasks_header: >
+      General Tasks

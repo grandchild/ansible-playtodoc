@@ -1,0 +1,83 @@
+---
+file:
+  - text:
+      - create the file $path|dest|name$
+      - owned by user $owner$ and group $group$
+    commands: |
+      touch $path|dest|name$
+      chown [[$owner$]]:[[$group$]] $name$
+    if:
+      state:
+        - present
+        - ~
+  - text:
+      - create the directory $path|dest|name$
+      - owned by user $owner$ and group $group$
+    commands: |
+      mkdir $path|dest|name$
+      chown -R [[$owner$]]:[[$group$]] $name$
+    if:
+      state:
+        - directory
+  - text:
+      - delete $path|dest|name$
+    commands: |
+      rm $path|dest|name$
+    if:
+      state:
+        - absent
+
+copy:
+  - text:
+      - copy the following file(s) to $dest$
+      - $src$
+
+user:
+  - text:
+      - the user $name$ of group $group$ exists
+      - and is in the following groups $groups$
+    commands: |
+      useradd -m[[ -g $group$]][[ -G $groups$]] $name$
+      # or
+      usermod[[ -g $group$]][[ -aG $groups$]] $name$
+    if:
+      state:
+        - present
+        - ~
+  - text: |
+      remove the user $name$
+    if:
+      state: absent
+
+template:
+  - text:
+      - create the file $dest$ with the following contents
+    content: $src$
+
+package:
+  - text:
+      - make sure the following packages are installed
+    content: $name$
+    if:
+      state:
+        - present
+        - ~
+  - text:
+      - install or update the following packages
+    content: $name$
+    if:
+      state: latest
+  - text:
+      - remove the following packages
+    content: $name$
+    if:
+      state:
+        - absent
+
+
+
+_unsupported:
+  - text:
+      - this ansible module is unsupported
+      - this is the ansible task code
+    content: $_ansible_task$
